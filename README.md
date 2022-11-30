@@ -1,5 +1,21 @@
 # PySlowFast
 
+## Parallelized Reversible Vision Transformers 
+
+This is a fork of [PySlowFast](https://github.com/facebookresearch/SlowFast), the official codebase for the original Reversible Vision Transformer paper. In this repo, we parallelize the backward pass of Reversible Vision Transformer (RevViT) using Pytorch CUDA Streams to achieve a speedup over the base RevViT using the Two-Stream method outlined in [Parallelizing Reversible Vision Transformers](https://tylerzhu.com/parallelrevvit). 
+
+As mentioned in the paper, this method does not speed up the base ViT models (and in fact uses more memory due to two streams of computation), but does offer appreciable throughput gains on the Rev-MViT line of models. To use this setting, simply set `MVIT.REV.USE_STREAM` to True in the config file, as follows.
+```yaml
+MVIT:
+  REV:
+    USE_STREAM: True
+```
+
+An example of such a script is in `configs/ImageNet/REV_VIT_S_STREAM.yaml` file. All changes are contained in the [`slowfast/models/reversible_mvit.py`](./slowfast/models/reversible_mvit.py) file, so start there if you are curious as to the implementation of this method. 
+
+## Main Repo
+
+
 PySlowFast is an open source video understanding codebase from FAIR that provides state-of-the-art video classification models with efficient training. This repository includes implementations of the following methods:
 
 - [SlowFast Networks for Video Recognition](https://arxiv.org/abs/1812.03982)

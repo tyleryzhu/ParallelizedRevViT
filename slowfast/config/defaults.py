@@ -625,6 +625,9 @@ _C.MVIT.REV.RES_PATH = "conv"
 # Method to merge hidden states before Qpoolinglayers
 _C.MVIT.REV.PRE_Q_FUSION = "avg"
 
+# Whether to use PyTorch streams to parallelize backward 
+_C.MVIT.REV.USE_STREAM = False
+
 # -----------------------------------------------------------------------------
 # SlowFast options
 # -----------------------------------------------------------------------------

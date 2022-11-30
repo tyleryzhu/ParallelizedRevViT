@@ -1,3 +1,5 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates. All Rights Reserved.
+
 import sys
 from functools import partial
 import torch
@@ -52,6 +54,12 @@ class ReversibleMViT(nn.Module):
 
         self.layers = nn.ModuleList([])
         self.no_custom_backward = False
+
+        # Initialize streams globally
+        if self.cfg.MVIT.REV.USE_STREAM:
+            global s1, s2
+            s1 = torch.cuda.Stream(device=torch.cuda.current_device())
+            s2 = torch.cuda.Stream(device=torch.cuda.current_device())
 
         if self.cfg.MVIT.NORM == "layernorm":
             norm_layer = partial(nn.LayerNorm, eps=1e-6)
@@ -165,6 +173,8 @@ class ReversibleMViT(nn.Module):
                 # no need for custom backprop in eval/model stat log
                 if not self.training or self.no_custom_backward:
                     executing_fn = ReversibleMViT.vanilla_backward
+                elif self.cfg.MVIT.REV.USE_STREAM:
+                    executing_fn = RevBackPropStream.apply
                 else:
                     executing_fn = RevBackProp.apply
 
@@ -182,7 +192,7 @@ class ReversibleMViT(nn.Module):
 
 class RevBackProp(Function):
     """
-    Custom Backpropagation function to allow (A) flusing memory in foward
+    Custom Backpropagation function to allow (A) flushing memory in foward
     and (B) activation recomputation reversibly in backward for gradient calculation.
 
     Inspired by https://github.com/RobinBruegger/RevTorch/blob/master/revtorch/revtorch.py
@@ -228,7 +238,7 @@ class RevBackProp(Function):
     def backward(ctx, dx):
         """
         Reversible Backward pass. Any intermediate activations from `buffer_layers` are
-        recovered from ctx. Each layer implements its own loic for backward pass (both
+        recovered from ctx. Each layer implements its own logic for backward pass (both
         activation recomputation and grad calculation).
         """
         dX_1, dX_2 = torch.chunk(dx, 2, dim=-1)
@@ -276,6 +286,116 @@ class RevBackProp(Function):
 
         return dx, None, None
 
+
+class RevBackPropStream(RevBackProp):
+    @staticmethod
+    def backward(ctx, dx):
+        """Overwrite backward by using PyTorch Streams to parallelize."""
+
+        dX_1, dX_2 = torch.chunk(dx, 2, dim=-1)
+
+        # retrieve params from ctx for backward
+        X_1, X_2, *int_tensors = ctx.saved_tensors
+
+        # no buffering
+        if len(int_tensors) != 0:
+            buffer_layers = int_tensors[0].tolist()
+
+        else:
+            buffer_layers = []
+
+        layers = ctx.layers
+
+        # Keep a dictionary of events to synchronize on
+        # Each is for the completion of a recalculation (f) or gradient calculation (b)
+        events = {}
+        for i in range(len(layers)):
+            events[f"f{i}"] = torch.cuda.Event()
+            events[f"b{i}"] = torch.cuda.Event()
+
+        # Run backward staggered on two streams, which were defined globally in __init__
+        # Initial pass
+        with torch.cuda.stream(s1):
+            layer = layers[-1]
+            if layer.layer_id in buffer_layers:
+                prev = layer.backward_pass_recover(
+                    Y_1=int_tensors[buffer_layers.index(layer.layer_id) * 2 + 1],
+                    Y_2=int_tensors[buffer_layers.index(layer.layer_id) * 2 + 2],
+                )
+            else:
+                prev = layer.backward_pass_recover(
+                    Y_1=X_1,
+                    Y_2=X_2,
+                )
+
+            events["f0"].record(s1)
+
+        # Stagger streams based on iteration
+        for i, (this_layer, next_layer) in enumerate(
+            zip(layers[1:][::-1], layers[:-1][::-1])
+        ):
+            if i % 2 == 0:
+                stream1 = s1
+                stream2 = s2
+            else:
+                stream1 = s2
+                stream2 = s1
+
+            with torch.cuda.stream(stream1):
+                # b{i} waits on b{i-1}
+                if i > 0:
+                    events[f"b{i-1}"].synchronize()
+
+                if i % 2 == 0:
+                    dY_1, dY_2 = this_layer.backward_pass_grads(*prev, dX_1, dX_2)
+                else:
+                    dX_1, dX_2 = this_layer.backward_pass_grads(*prev, dY_1, dY_2)
+
+                events[f"b{i}"].record(stream1)
+
+            with torch.cuda.stream(stream2):
+                # f{i} waits on f{i-1}
+                events[f"f{i}"].synchronize()
+
+                if next_layer.layer_id in buffer_layers:
+                    prev = next_layer.backward_pass_recover(
+                        Y_1=int_tensors[buffer_layers.index(next_layer.layer_id) * 2 + 1],
+                        Y_2=int_tensors[buffer_layers.index(next_layer.layer_id) * 2 + 2],
+                    )
+                else:
+                    prev = next_layer.backward_pass_recover(
+                        Y_1=prev[0],
+                        Y_2=prev[1],
+                    )
+
+                events[f"f{i+1}"].record(stream2)
+
+        # Last iteration
+        if len(layers) - 1 % 2 == 0:
+            stream2 = s1
+        else:
+            stream2 = s2
+        next_layer = layers[0]
+            
+        with torch.cuda.stream(stream2):
+            # stream2.wait_event(events[f"b{len(layers)-2}_end"])
+            events[f"b{len(layers)-2}"].synchronize()
+            if len(layers) - 1 % 2 == 0:
+                dY_1, dY_2 = next_layer.backward_pass_grads(*prev, dX_1, dX_2)
+                dx = torch.cat([dY_1, dY_2], dim=-1)
+            else:
+                dX_1, dX_2 = next_layer.backward_pass_grads(*prev, dY_1, dY_2)
+                dx = torch.cat([dX_1, dX_2], dim=-1)
+            events[f"b{len(layers)-1}"].record(stream2)
+
+        # Synchronize, for PyTorch 1.9
+        torch.cuda.current_stream().wait_stream(s1)
+        torch.cuda.current_stream().wait_stream(s2)
+        events[f"b{len(layers)-1}"].synchronize()
+
+        del int_tensors
+        del dX_1, dX_2, dY_1, dY_2, X_1, X_2, prev[:]
+        return dx, None, None
 
 class StageTransitionBlock(nn.Module):
     """
@@ -507,7 +627,11 @@ class ReversibleBlock(nn.Module):
         self.seeds[key] = seed
         torch.manual_seed(self.seeds[key])
 
-    def forward(self, X_1, X_2):
+    def forward(
+        self,
+        X_1,
+        X_2,
+    ):
         """
         forward pass equations:
         Y_1 = X_1 + Attention(X_2), F = Attention
@@ -610,6 +734,66 @@ class ReversibleBlock(nn.Module):
             X_2 = X_2.detach()
 
         return X_1, X_2, dY_1, dY_2
+    
+    def backward_pass_recover(self, Y_1, Y_2):
+        """
+        Use equations to recover activations and return them.
+
+        Used for streaming the backward pass.
+        """
+        with torch.enable_grad():
+            Y_1.requires_grad = True
+
+            torch.manual_seed(self.seeds["FFN"])
+            g_Y_1 = self.G(Y_1)
+
+            torch.manual_seed(self.seeds["droppath"])
+            g_Y_1 = drop_path(
+                g_Y_1, drop_prob=self.drop_path_rate, training=self.training
+            )
+
+        with torch.no_grad():
+            X_2 = Y_2 - g_Y_1
+
+        with torch.enable_grad():
+            X_2.requires_grad = True
+
+            torch.manual_seed(self.seeds["attn"])
+            f_X_2 = self.F(X_2)
+
+            torch.manual_seed(self.seeds["droppath"])
+            f_X_2 = drop_path(
+                f_X_2, drop_prob=self.drop_path_rate, training=self.training
+            )
+
+        with torch.no_grad():
+            X_1 = Y_1 - f_X_2
+
+        # Keep tensors around to do backprop on the graph.
+        ctx = [X_1, X_2, Y_1, g_Y_1, f_X_2]
+        return ctx
+
+    def backward_pass_grads(self, X_1, X_2, Y_1, g_Y_1, f_X_2, dY_1, dY_2):
+        """
+        Receive intermediate activations and inputs to backprop through.
+        """
+
+        with torch.enable_grad():
+            g_Y_1.backward(dY_2)
+
+        with torch.no_grad():
+            dY_1 = dY_1 + Y_1.grad
+            Y_1.grad = None
+
+        with torch.enable_grad():
+            f_X_2.backward(dY_1)
+
+        with torch.no_grad():
+            dY_2 = dY_2 + X_2.grad
+            X_2.grad = None
+            X_2.detach()
+
+        return dY_1, dY_2
 
 
 class MLPSubblock(nn.Module):
