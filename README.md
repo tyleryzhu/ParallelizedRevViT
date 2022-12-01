@@ -2,7 +2,10 @@
 
 ## Parallelized Reversible Vision Transformers 
 
-This is a fork of [PySlowFast](https://github.com/facebookresearch/SlowFast), the official codebase for the original Reversible Vision Transformer paper. In this repo, we parallelize the backward pass of Reversible Vision Transformer (RevViT) using Pytorch CUDA Streams to achieve a speedup over the base RevViT using the Two-Stream method outlined in [Parallelizing Reversible Vision Transformers](https://tylerzhu.com/parallelrevvit). 
+<p align="center"><img width="606" alt="parallel_ss" src="https://user-images.githubusercontent.com/22010655/205030427-1f9e04c0-2f2b-4d22-8dfa-c6024c40c1f1.png"> </p>
+
+
+This is a fork of [PySlowFast](https://github.com/facebookresearch/SlowFast), the official codebase for the original Reversible Vision Transformer paper. In this repo, we parallelize the backward pass of Reversible Vision Transformer (RevViT) using Pytorch CUDA Streams to achieve a speedup over the base RevViT using the Two-Stream method outlined in [Parallelized Reversible Vision Transformers](https://tylerzhu.com/parallelrevvit). 
 
 As mentioned in the paper, this method does not speed up the base ViT models (and in fact uses more memory due to two streams of computation), but does offer appreciable throughput gains on the Rev-MViT line of models. To use this setting, simply set `MVIT.REV.USE_STREAM` to True in the config file, as follows.
 ```yaml
