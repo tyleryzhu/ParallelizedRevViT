@@ -4,6 +4,7 @@
 
 <p align="center"><img width="606" alt="parallel_ss" src="https://user-images.githubusercontent.com/22010655/205030427-1f9e04c0-2f2b-4d22-8dfa-c6024c40c1f1.png"> </p>
 
+[[Paper]](https://tylerzhu.com/research/data/parallelrevvit.pdf)
 
 This is a fork of [PySlowFast](https://github.com/facebookresearch/SlowFast), the official codebase for the original Reversible Vision Transformer paper. In this repo, we parallelize the backward pass of Reversible Vision Transformer (RevViT) using Pytorch CUDA Streams to achieve a speedup over the base RevViT using the Two-Stream method outlined in [Parallelized Reversible Vision Transformers](https://tylerzhu.com/parallelrevvit). 
 
